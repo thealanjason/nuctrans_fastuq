@@ -28,6 +28,7 @@ import yaml
 WORKFLOW_DIR = Path(__file__).resolve().parents[1]
 
 # manifest format and registry names are shared with the uq package
+from .data_io import QOI_DEFAULT
 from .manifest import (  # noqa: F401  (re-exported)
     ENGINE_FILENAME,
     manifest_path_for,
@@ -270,7 +271,8 @@ class Experiment:
         """Parse surrogate.z_interest into (discrete_depths_or_names, list_of_ranges)."""
         z = self.surrogate.get("z_interest")
         if z is None:
-            raise KeyError(f"Experiment '{self.name}' requires surrogate.z_interest")
+            # aggregated QoI (one value per time step per label): no depths
+            return [], []
 
         if isinstance(z, str) and z.strip().lower() in ("all", "whole_column"):
             return [], [(None, None)]
@@ -370,20 +372,11 @@ class Experiment:
         return float(v)
 
     @property
-    def qoi_floor(self):
-        """Numerical noise floor threshold. Can be a float or dict mapping QoI -> float.
-        If omitted from config, defaults to 1e-20 for flux QoIs, and 1e-12 for concentration QoIs.
-        """
-        val = self.surrogate.get("qoi_floor")
-        is_flux = "flux" in self.output_qoi.lower()
-        default_val = 1e-20 if is_flux else 1e-12
-
-        if val is None:
-            return default_val
-        if isinstance(val, dict):
-            qoi_val = val.get(self.output_qoi)
-            return float(qoi_val) if qoi_val is not None else default_val
-        return float(val)
+    def qoi(self):
+        """Per-QoI settings: unit, factor, signed, floor (see data_io.QOI_DEFAULT)."""
+        if "qoi_floor" in self.surrogate:
+            raise ValueError("surrogate.qoi_floor was replaced by surrogate.qoi: {floor: ...}")
+        return {**QOI_DEFAULT, **(self.surrogate.get("qoi") or {})}
 
     @property
     def transform(self):
@@ -595,7 +588,7 @@ class Experiment:
             "z_min_variance": self.z_min_variance,
             "t_interest": self.t_interest,
             "transform": self.transform,
-            "qoi_floor": self.qoi_floor,
+            "qoi": self.qoi,
             "n_init": self.n_init,
             "seed": self.seed,
             "training_data": self.training_path.name,
@@ -775,7 +768,7 @@ class Experiment:
         lines += [
             f"Surrogate  : {self.run_name}",
             f"Type       : {self.surrogate_type}",
-            f"QoI        : {self.output_qoi} (qoi_floor={self.qoi_floor:g})",
+            f"QoI        : {self.output_qoi} (qoi={self.qoi})",
             f"Engine     -> {engine_rel}  ({status})",
             f"Depths     : {depth_desc}",
         ]
