@@ -6,8 +6,8 @@ data_io.py - Read the model box's HDF5 files into X and y for the surrogate.
 File layout:
 
     sampled_data/uncertain_parameters/{folder}/{layer}/{property} -> (n_samples,)
-    simulation_results/{qoi}/keys   -> (n_points, 4), rows are (x, y, z, t);
-                                       aggregated QoIs: group "0" = label, "1" = t
+    simulation_results/{qoi}/keys   -> columns x, y, z, t (group "0".."3", or one (n_points, 4) dataset);
+                                       aggregated QoIs: columns label, t
     simulation_results/{qoi}/values -> (n_points, n_samples)
                                        (n_points, n_samples, n_comp) for Flux
 
@@ -117,6 +117,22 @@ def _nearest(available, requested):
     return int(np.argmin(np.abs(np.asarray(available) - float(requested))))
 
 
+def read_key_columns(keys):
+    """Key columns as a list of arrays, from either layout of `keys`.
+
+    New: a group with one dataset per column ("0", "1", ...), text columns as strings.
+    Old: one numeric (n_points, n_cols) dataset.
+    """
+    if isinstance(keys, h5py.Dataset):
+        arr = keys[:]
+        return [arr[:, i] for i in range(arr.shape[1])]
+    cols = []
+    for i in range(len(keys)):
+        ds = keys[str(i)]
+        cols.append(ds.asstr()[:] if ds.dtype.kind in "OSU" else ds[:])
+    return cols
+
+
 def read_response(h5file, output_qoi, z_interest=None, t_interest=None,
                   flux_component=2):
     """One QoI as {depth_label: array(n_samples, n_timesteps)}.
@@ -134,14 +150,14 @@ def read_response(h5file, output_qoi, z_interest=None, t_interest=None,
             f"QoI '{output_qoi}' not in the results. Available: {list(results.keys())}"
         )
 
-    keys = results[output_qoi]["keys"][:]        # (n_points, 4) -> x, y, z, t
+    cols = read_key_columns(results[output_qoi]["keys"])    # x, y, z, t
     values = results[output_qoi]["values"][:]    # (n_points, n_samples[, n_comp])
 
     # vector QoI (Flux): keep one component
     if values.ndim == 3:
         values = values[:, :, flux_component]
 
-    z, t = keys[:, 2], keys[:, 3] / SECONDS_PER_YEAR
+    z, t = cols[2], cols[3] / SECONDS_PER_YEAR
 
     z_all = np.unique(z)
     t_all = np.unique(t)
@@ -185,8 +201,7 @@ def read_response_cell_data(h5file, output_qoi, t_interest=None):
     Returns (y, t_values).
     """
     results = h5file[RESPONSE_KEY]
-    keys = results[output_qoi]["keys"]    # group: "0" = labels, "1" = t
-    labels, t = keys["0"].asstr()[:], keys["1"][:]
+    labels, t = read_key_columns(results[output_qoi]["keys"])
     labels = np.asarray(labels)
     t = np.asarray(t, dtype=float) / SECONDS_PER_YEAR
     values = results[output_qoi]["values"][:]    # (n_points, n_samples)
@@ -267,12 +282,12 @@ def read_response_moving_boundary(h5file, output_qoi, z_interest, param_names, X
             f"QoI '{output_qoi}' not in the results. Available: {list(results.keys())}"
         )
 
-    keys = results[output_qoi]["keys"][:]
+    cols = read_key_columns(results[output_qoi]["keys"])
     values = results[output_qoi]["values"][:]
     if values.ndim == 3:
         values = values[:, :, flux_component]
 
-    z, t = keys[:, 2], keys[:, 3] / SECONDS_PER_YEAR
+    z, t = cols[2], cols[3] / SECONDS_PER_YEAR
 
     t_all = np.unique(t)
     t_keep = t_all if t_interest is None else np.array(
@@ -523,10 +538,10 @@ def describe(file_path):
         if RESPONSE_KEY in f:
             print(f"\nQoIs available: {list(f[RESPONSE_KEY].keys())}")
             for q in f[RESPONSE_KEY]:
-                k = f[RESPONSE_KEY][q]["keys"]
+                cols = read_key_columns(f[RESPONSE_KEY][q]["keys"])
                 v = f[RESPONSE_KEY][q]["values"]
-                z = np.unique(k[:, 2])
-                t = np.unique(k[:, 3])
+                z = np.unique(cols[2])
+                t = np.unique(cols[3])
                 print(f"   {q}: {len(z)} depths x {len(t)} time steps, "
                       f"values{v.shape}")
         else:
