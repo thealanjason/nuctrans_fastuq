@@ -27,8 +27,7 @@ _STR = h5py.string_dtype(encoding="utf-8")
 
 def read_header(engine_path):
     with h5py.File(engine_path, "r") as f:
-        header = {k: str(f.attrs[k]) for k in ("scenario", "engine_name", "surrogate_type", "output_qoi")}
-    header["qoi_unit"] = "mol/(m² year)" if "flux" in header["output_qoi"].lower() else "mol/L"
+        header = {k: str(f.attrs[k]) for k in ("scenario", "engine_name", "surrogate_type", "output_qoi", "qoi_unit")}
     return header
 
 
