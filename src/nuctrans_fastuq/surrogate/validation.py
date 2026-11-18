@@ -2,6 +2,9 @@
 
 import numpy as np
 
+# cut-offs are relative to the data, so small-magnitude QoIs (~1e-9) still get metrics
+REL_EPS = 1e-12
+
 
 def validation_error(true_y, sim_y, sim_std=None, std_metrics=False):
     """
@@ -56,8 +59,8 @@ def validation_error(true_y, sim_y, sim_std=None, std_metrics=False):
         criteria_dict['rmse'][key] = np.sqrt(np.mean(res ** 2, axis=0))
         criteria_dict['mse'][key] = np.mean(res ** 2, axis=0)
 
-        # R2 & NSE: only defined where true data has meaningful variance (var_true >= 1e-12)
-        valid_var = var_t >= 1e-12
+        # R2 & NSE: only defined where true data has meaningful variance (relative to the largest variance)
+        valid_var = var_t > REL_EPS * np.nanmax(var_t)
         ss_res = np.sum(res ** 2, axis=0)
         ss_tot = np.sum((t_mat - mean_t) ** 2, axis=0)
         
@@ -66,13 +69,13 @@ def validation_error(true_y, sim_y, sim_std=None, std_metrics=False):
         criteria_dict['r2'][key] = r2_arr
         criteria_dict['nse'][key] = r2_arr.copy()
 
-        # Mean error: only defined where true mean is non-zero (mean_true >= 1e-12)
-        valid_mean = np.abs(mean_t) >= 1e-12
+        # Mean error: only defined where true mean is non-zero (relative to the largest mean)
+        valid_mean = np.abs(mean_t) > REL_EPS * np.nanmax(np.abs(mean_t))
         mean_err_arr = np.full(n_obs, np.nan)
         mean_err_arr[valid_mean] = np.abs(mean_t[valid_mean] - mean_p[valid_mean]) / np.abs(mean_t[valid_mean])
         criteria_dict['mean_error'][key] = mean_err_arr
 
-        # Std error: only defined where true std is non-zero (std_true >= 1e-12)
+        # Std error: only defined where true std is non-zero (relative to the largest variance)
         std_err_arr = np.full(n_obs, np.nan)
         std_err_arr[valid_var] = np.abs(std_t[valid_var] - std_p[valid_var]) / std_t[valid_var]
         criteria_dict['std_error'][key] = std_err_arr
@@ -81,7 +84,7 @@ def validation_error(true_y, sim_y, sim_std=None, std_metrics=False):
         pearson_arr = np.full(n_obs, np.nan)
         var_p = np.var(p_mat, axis=0)
         for j in range(n_obs):
-            if valid_var[j] and var_p[j] >= 1e-12:
+            if valid_var[j] and var_p[j] > REL_EPS * np.nanmax(var_p):
                 pearson_arr[j] = np.corrcoef(t_mat[:, j], p_mat[:, j])[0, 1]
         criteria_dict['pearson_r'][key] = pearson_arr
 
@@ -90,8 +93,8 @@ def validation_error(true_y, sim_y, sim_std=None, std_metrics=False):
             upper_ci = p_mat + (1.96 * sm_std)
             lower_ci = p_mat - (1.96 * sm_std)
 
-            # Normalized error (only where sim_std >= 1e-12)
-            valid_std = sm_std >= 1e-12
+            # Normalized error (only where sim_std is not negligible)
+            valid_std = sm_std > REL_EPS * np.nanmax(sm_std)
             ind_val = np.full_like(p_mat, np.nan)
             np.divide(p_mat - t_mat, sm_std, out=ind_val, where=valid_std)
             criteria_dict['norm_error'][key] = np.nanmean(ind_val ** 2, axis=0)

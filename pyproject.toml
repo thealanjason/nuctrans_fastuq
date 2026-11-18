@@ -27,6 +27,7 @@ dependencies = [
     # engine file and the rest
     "h5py",
     "pyyaml",
+    "shapely",
 ]
 
 [project.optional-dependencies]

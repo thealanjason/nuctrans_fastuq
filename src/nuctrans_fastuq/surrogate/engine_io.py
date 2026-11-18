@@ -507,6 +507,7 @@ def _save(engine, path, scenario, engine_name, output_qoi, settings):
         f.attrs["engine_name"] = str(engine_name)
         f.attrs["surrogate_type"] = kind
         f.attrs["output_qoi"] = str(output_qoi)
+        f.attrs["qoi_unit"] = (settings or {}).get("qoi", {}).get("unit", "")
         f.attrs["settings_json"] = json.dumps(settings or {}, default=str)
 
         g = f.create_group("coordinates")

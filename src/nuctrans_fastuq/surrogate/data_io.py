@@ -6,12 +6,13 @@ data_io.py - Read the model box's HDF5 files into X and y for the surrogate.
 File layout:
 
     sampled_data/uncertain_parameters/{folder}/{layer}/{property} -> (n_samples,)
-    simulation_results/{qoi}/keys   -> (n_points, 4), rows are (x, y, z, t)
+    simulation_results/{qoi}/keys   -> columns x, y, z, t (group "0".."3", or one (n_points, 4) dataset);
+                                       aggregated QoIs: columns label, t
     simulation_results/{qoi}/values -> (n_points, n_samples)
                                        (n_points, n_samples, n_comp) for Flux
 
 keys and values are parallel arrays, ordered all depths for t0, then t1, ...
-Only 1D (x = y = 0) is supported. Depths are picked by nearest node, not
+Only 1D is supported (x, y are not checked; 2D/3D files are not detected). Depths are picked by nearest node, not
 interpolated, so values from two layers are never mixed.
 
 A file without simulation_results gives y = None.
@@ -24,9 +25,14 @@ import numpy as np
 
 # OGS time is in seconds; the surrogate box uses years (365.25 days)
 SECONDS_PER_YEAR = 31_557_600.0
-# 1 m³ = 1000 L: converts (mol/L)*(m/s) -> mol/(m²*year) when multiplied with SECONDS_PER_YEAR
-LITERS_PER_M3 = 1000.0
-FLUX_TO_ANNUAL_M2 = LITERS_PER_M3 * SECONDS_PER_YEAR
+# Per-QoI settings come from the experiment yaml (surrogate.qoi), never from the QoI name.
+# Defaults leave the values untouched.
+#   unit    label for the plots and the engine
+#   factor  multiplies the raw model values (e.g. mol/L * m/s -> mol/(m² year))
+#   signed  True: the floor applies to |y|; False: values below the floor are set to 0
+#   floor   values below this (in raw model units) are set to 0; 0 = no floor
+QOI_DEFAULT = {"unit": "", "factor": 1.0, "signed": True, "floor": 0.0}
+
 
 # Group order; fixes the column order of X
 GROUP_ORDER = (
@@ -111,6 +117,22 @@ def _nearest(available, requested):
     return int(np.argmin(np.abs(np.asarray(available) - float(requested))))
 
 
+def read_key_columns(keys):
+    """Key columns as a list of arrays, from either layout of `keys`.
+
+    New: a group with one dataset per column ("0", "1", ...), text columns as strings.
+    Old: one numeric (n_points, n_cols) dataset.
+    """
+    if isinstance(keys, h5py.Dataset):
+        arr = keys[:]
+        return [arr[:, i] for i in range(arr.shape[1])]
+    cols = []
+    for i in range(len(keys)):
+        ds = keys[str(i)]
+        cols.append(ds.asstr()[:] if ds.dtype.kind in "OSU" else ds[:])
+    return cols
+
+
 def read_response(h5file, output_qoi, z_interest=None, t_interest=None,
                   flux_component=2):
     """One QoI as {depth_label: array(n_samples, n_timesteps)}.
@@ -128,19 +150,14 @@ def read_response(h5file, output_qoi, z_interest=None, t_interest=None,
             f"QoI '{output_qoi}' not in the results. Available: {list(results.keys())}"
         )
 
-    keys = results[output_qoi]["keys"][:]        # (n_points, 4) -> x, y, z, t
+    cols = read_key_columns(results[output_qoi]["keys"])    # x, y, z, t
     values = results[output_qoi]["values"][:]    # (n_points, n_samples[, n_comp])
 
     # vector QoI (Flux): keep one component
     if values.ndim == 3:
         values = values[:, :, flux_component]
 
-    x, yc, z, t = keys[:, 0], keys[:, 1], keys[:, 2], keys[:, 3] / SECONDS_PER_YEAR
-    if not (np.allclose(x, 0.0) and np.allclose(yc, 0.0)):
-        raise NotImplementedError(
-            "Non-zero x/y found: this file is 2D/3D. read_response() currently "
-            "assumes a 1D column (x = y = 0)."
-        )
+    z, t = cols[2], cols[3] / SECONDS_PER_YEAR
 
     z_all = np.unique(z)
     t_all = np.unique(t)
@@ -163,6 +180,51 @@ def read_response(h5file, output_qoi, z_interest=None, t_interest=None,
         cols = [rows[np.flatnonzero(t_rows == tv)[0]] for tv in t_keep]
         # (n_timesteps, n_samples) -> (n_samples, n_timesteps)
         y[str(float(z_target))] = values[cols, :].T.reshape(n_samples, len(t_keep))
+
+    return y, t_keep
+
+
+def is_cell_data(h5file, output_qoi):
+    """True if the QoI is aggregated: its first key column is text, not numeric."""
+    if RESPONSE_KEY not in h5file or output_qoi not in h5file[RESPONSE_KEY]:
+        return False
+    keys = h5file[RESPONSE_KEY][output_qoi]["keys"]
+    return isinstance(keys, h5py.Group) and keys["0"].dtype.kind in "OSU"
+
+
+def read_response_cell_data(h5file, output_qoi, t_interest=None):
+    """One aggregated QoI as {label: array(n_samples, n_timesteps)}.
+
+    Keys are rows of (label, t): one value per time step for each label
+    (e.g. a zone's total release rate). t is in seconds like the field QoIs.
+    The region itself is defined in the model YAML, not here.
+    Returns (y, t_values).
+    """
+    results = h5file[RESPONSE_KEY]
+    labels, t = read_key_columns(results[output_qoi]["keys"])
+    labels = np.asarray(labels)
+    t = np.asarray(t, dtype=float) / SECONDS_PER_YEAR
+    values = results[output_qoi]["values"][:]    # (n_points, n_samples)
+    t_all = np.unique(t)
+    t_keep = t_all if t_interest is None else np.array(
+        [t_all[_nearest(t_all, tv)] for tv in np.atleast_1d(t_interest)]
+    )
+
+    n_samples = values.shape[1]
+    y = {}
+    for label in dict.fromkeys(labels):          # keep file order
+        rows = np.flatnonzero(labels == label)
+        t_rows = t[rows]
+        cols = []
+        for tv in t_keep:
+            hit = np.flatnonzero(t_rows == tv)
+            if len(hit) != 1:
+                raise ValueError(
+                    f"Aggregated QoI '{output_qoi}', label '{label}': expected one row "
+                    f"at t={tv:g} years, found {len(hit)}."
+                )
+            cols.append(rows[hit[0]])
+        y[str(label)] = values[cols, :].T.reshape(n_samples, len(t_keep))
 
     return y, t_keep
 
@@ -220,17 +282,12 @@ def read_response_moving_boundary(h5file, output_qoi, z_interest, param_names, X
             f"QoI '{output_qoi}' not in the results. Available: {list(results.keys())}"
         )
 
-    keys = results[output_qoi]["keys"][:]
+    cols = read_key_columns(results[output_qoi]["keys"])
     values = results[output_qoi]["values"][:]
     if values.ndim == 3:
         values = values[:, :, flux_component]
 
-    x, yc, z, t = keys[:, 0], keys[:, 1], keys[:, 2], keys[:, 3] / SECONDS_PER_YEAR
-    if not (np.allclose(x, 0.0) and np.allclose(yc, 0.0)):
-        raise NotImplementedError(
-            "Non-zero x/y found: this file is 2D/3D. "
-            "read_response_moving_boundary() currently assumes a 1D column."
-        )
+    z, t = cols[2], cols[3] / SECONDS_PER_YEAR
 
     t_all = np.unique(t)
     t_keep = t_all if t_interest is None else np.array(
@@ -365,16 +422,12 @@ def _filter_depths(y, z_range, z_min_variance, path, discrete_depths=None):
 
 def load_and_extract_data(file_path, output_qoi, z_interest=None, t_interest=None,
                           transform_config=None, flux_component=2,
-                          param_names=None, qoi_floor=None,
+                          param_names=None, qoi=None,
                           z_range=None, z_min_variance=None, keep_keys=None):
     """Load an HDF5 file from the model box, formatted for BayesValidRox.
     Args:
         param_names: column order for X, from prepare_data.get_param_names_from_config().
-        qoi_floor: numerical noise floor threshold. Values below this threshold
-            are set to 0.0 on raw OGS units. For flux, the threshold
-            applies to absolute values |y| < qoi_floor to preserve negative fluxes.
-            If None, defaults to 1e-20 for flux QoIs and 1e-12 for concentration QoIs.
-            Non-zero flux outputs are converted to mol/(m²·year).
+        qoi: floor, factor and signed of this QoI, see QOI_DEFAULT. Missing keys use the defaults.
         z_range: (top, bottom) depth window, or list of intervals [(top, bottom), ...]; None = no limit.
         z_min_variance: drop depths that vary less than this.
         keep_keys: exact depths to keep for validation.
@@ -414,8 +467,22 @@ def load_and_extract_data(file_path, output_qoi, z_interest=None, t_interest=Non
     print(f"Loading samples from: {path}")
     with h5py.File(path, "r") as f:
         X, param_names = read_design(f, param_names=param_names)
+        cell_data = is_cell_data(f, output_qoi)
+        if RESPONSE_KEY in f and output_qoi in f[RESPONSE_KEY]:
+            if cell_data and (z_list or norm_ranges):
+                raise ValueError(
+                    f"QoI '{output_qoi}' is aggregated (text keys): z_interest must be "
+                    f"null, got {z_interest!r}."
+                )
+            if is_moving_boundary and not cell_data and not z_list:
+                raise KeyError(
+                    f"QoI '{output_qoi}' has sampled geometry and needs "
+                    f"surrogate.z_interest (boundary names or depths)."
+                )
         if RESPONSE_KEY not in f:
             y, t_values = None, None
+        elif cell_data:
+            y, t_values = read_response_cell_data(f, output_qoi, t_interest)
         elif is_moving_boundary:
             y, t_values = read_response_moving_boundary(
                 f, output_qoi, z_list, param_names, X,
@@ -430,27 +497,13 @@ def load_and_extract_data(file_path, output_qoi, z_interest=None, t_interest=Non
             )
 
     if y is not None:
-        is_flux = "flux" in output_qoi.lower()
-        if qoi_floor is not None:
-            threshold = float(qoi_floor)
-        elif is_flux:
-            threshold = 1e-20  # (mol/L)/(m/s)
-        else:
-            threshold = 1e-12
-
-        if threshold is not None and threshold > 0:
+        q = {**QOI_DEFAULT, **(qoi or {})}
+        if q["floor"] > 0:
             for key in y:
-                if is_flux:
-                    # For flux, threshold using absolute magnitude so negative values are preserved
-                    y[key][np.abs(y[key]) < threshold] = 0.0
-                else:
-                    # For concentration (non-negative), values below threshold are numerical noise
-                    y[key][y[key] < threshold] = 0.0
-
-        # Convert flux from (mol/L)*(m/s) to mol/(m²*year) (LITERS_PER_M3 * SECONDS_PER_YEAR)
-        if is_flux:
-            for key in y:
-                y[key] = y[key] * FLUX_TO_ANNUAL_M2
+                small = np.abs(y[key]) < q["floor"] if q["signed"] else y[key] < q["floor"]
+                y[key][small] = 0.0
+        for key in y:
+            y[key] = y[key] * q["factor"]
 
         # depth window + drop flat depths; after the floor, so it sees the floored values
         if keep_keys is not None:
@@ -461,7 +514,7 @@ def load_and_extract_data(file_path, output_qoi, z_interest=None, t_interest=Non
                     f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
                 )
             y = {k: y[k] for k in keep_keys}
-        elif not is_moving_boundary and (norm_ranges or (z_min_variance is not None and target_z is None)):
+        elif not cell_data and not is_moving_boundary and (norm_ranges or (z_min_variance is not None and target_z is None)):
             discrete = z_list if norm_ranges else None
             y = _filter_depths(y, norm_ranges, z_min_variance, path, discrete_depths=discrete)
 
@@ -485,10 +538,10 @@ def describe(file_path):
         if RESPONSE_KEY in f:
             print(f"\nQoIs available: {list(f[RESPONSE_KEY].keys())}")
             for q in f[RESPONSE_KEY]:
-                k = f[RESPONSE_KEY][q]["keys"]
+                cols = read_key_columns(f[RESPONSE_KEY][q]["keys"])
                 v = f[RESPONSE_KEY][q]["values"]
-                z = np.unique(k[:, 2])
-                t = np.unique(k[:, 3])
+                z = np.unique(cols[2])
+                t = np.unique(cols[3])
                 print(f"   {q}: {len(z)} depths x {len(t)} time steps, "
                       f"values{v.shape}")
         else:

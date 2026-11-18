@@ -1,0 +1,5 @@
+label,filter,color
+Crystalline host rock,"""Wirtsgestein"" = 'Kristallin'",#F5A184
+Host rock salt,"""Wirtsgestein"" LIKE 'Steinsalz%'",#CBE7F5
+Host rock clay,"""Wirtsgestein"" = 'Tongestein'",#BCB2D4
+Other,,#E31A1C

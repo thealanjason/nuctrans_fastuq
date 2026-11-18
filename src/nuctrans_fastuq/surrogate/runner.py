@@ -115,7 +115,7 @@ def train_surrogate(
     parallel=False,
     verbose=True,
     transform=None,
-    qoi_floor=None,      # numerical noise floor threshold
+    qoi=None,            # floor, factor, signed (data_io.QOI_DEFAULT)
     z_range=None,        # (top, bottom) depth window or list of intervals
     z_min_variance=None, # drop depths that do not vary across samples
     engine_path=None,    # where to save engine.h5 (Experiment.engine_path)
@@ -153,7 +153,7 @@ def train_surrogate(
 
     X_train, train_output_at_x, _, t_values_array = load_and_extract_data(
         training_path, output_qoi, z_interest, t_interest,
-        param_names=param_names, qoi_floor=qoi_floor,
+        param_names=param_names, qoi=qoi,
         z_range=z_range, z_min_variance=z_min_variance,
     )
 
@@ -186,7 +186,7 @@ def train_surrogate(
             # Keep the same depths as training
             X_val, valid_y, _, _ = load_and_extract_data(
                 validation_path, output_qoi, z_interest, t_interest,
-                param_names=param_names, qoi_floor=qoi_floor,
+                param_names=param_names, qoi=qoi,
                 keep_keys=(list(train_output_at_x)
                            if train_output_at_x is not None else None),
                 z_range=z_range, z_min_variance=z_min_variance,
