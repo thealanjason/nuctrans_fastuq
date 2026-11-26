@@ -19,6 +19,7 @@ import numpy as np
 import yaml
 
 from ..surrogate.engine_io import load_engine
+from ..surrogate.scaling import clip_scaled, clipped_fraction, descale_prediction, scaled_range
 from .sensitivity import _STR, _dataset, _to_float, read_header
 
 KEYS = ("n_samples", "seed")
@@ -46,21 +47,34 @@ def check_settings(settings):
 
 
 def propagate(engine, n_samples, seed, sampling_method="random"):
-    """Sample the inputs and evaluate the surrogate: X [sample, param], mean and std [sample, time, depth]."""
+    """Sample the inputs and evaluate the surrogate: X [sample, param], mean and std [sample, time, depth], and
+    clipped {"below": [depth], "above": [depth]}, the fraction of predictions clipped to the training range
+    (log scaling only, else 0)."""
     np.random.seed(seed)  # chaospy draws from the global numpy generator
     x = np.asarray(engine.exp_design.generate_samples(n_samples, sampling_method), dtype=float)
-    mean, std = engine.meta_model.eval_metamodel(x)  # per depth: [sample, time]
+    mean, std = engine.meta_model.eval_metamodel(x)  # per depth: [sample, time], in the scaled units of the training
+    config = getattr(engine, "scaling_config", None)
+    fractions = {}
+    if config is not None:  # back to physical units: the median prediction and the exact std (lognormal for log)
+        train_range = scaled_range({d: engine.exp_design.y[d] for d in engine.out_names})
+        fractions = clipped_fraction(mean, config, train_range)
+        mean = clip_scaled(mean, config, train_range)  # log: no overshoot above the training range
+        mean, std = descale_prediction(mean, std, config)
     stack = lambda res: np.stack([np.asarray(res[d], dtype=float) for d in engine.out_names], axis=-1)  # noqa: E731
-    return x, stack(mean), stack(std)
+    below, above = np.array([fractions.get(d, (0.0, 0.0)) for d in engine.out_names]).reshape(-1, 2).T
+    return x, stack(mean), stack(std), {"below": below, "above": above}
 
 
 def write_propagation(engine, path, header, settings):
-    """Propagate the inputs through the engine and write path (kept untouched if this fails)."""
+    """Propagate the inputs through the engine and write path (kept untouched if this fails).
+
+    Returns the clipped fractions of propagate (also written as output/clipped_below and output/clipped_above).
+    """
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     try:
         settings = check_settings(settings)
-        x, mean, std = propagate(engine, **settings)
+        x, mean, std, clipped = propagate(engine, **settings)
         with h5py.File(tmp, "w") as f:
             for key, value in header.items():
                 f.attrs[key] = value
@@ -80,10 +94,13 @@ def write_propagation(engine, path, header, settings):
             out = f.create_group("output")
             for name, data in (("mean", mean), ("std", std)):
                 _dataset(out, name, data, ["sample", "time", "depth"], compression="gzip", compression_opts=4)
+            for side in ("below", "above"):  # fraction of the [sample, time] predictions per depth
+                _dataset(out, f"clipped_{side}", clipped[side], ["depth"])
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+    return clipped
 
 
 def main():
@@ -95,8 +112,12 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as f:
         settings = yaml.safe_load(f) or {}
-    write_propagation(load_engine(args.engine), args.output, read_header(args.engine), settings)
+    clipped = write_propagation(load_engine(args.engine), args.output, read_header(args.engine), settings)
     print(f"wrote {args.output}")
+    # every depth has the same number of predictions, so the mean over depths is the overall fraction
+    print(f"predictions clipped to the training range: {clipped['below'].mean():.2%} below, "
+          f"{clipped['above'].mean():.2%} above (worst depth: {clipped['below'].max():.2%}, "
+          f"{clipped['above'].max():.2%})")
 
 
 if __name__ == "__main__":

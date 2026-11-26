@@ -282,9 +282,11 @@ def _write_scaling(f, config):
         g.attrs["min"] = float(config["scaler"].min_[0])
         g.attrs["scale"] = float(config["scaler"].scale_[0])
         g.attrs["data_min"] = float(config["scaler"].data_min_[0])
-        g.attrs["data_range"] = float(config["scaler"].data_range_[0])  # used by descale_std
+        g.attrs["data_range"] = float(config["scaler"].data_range_[0])
         g.attrs["data_max"] = float(config["scaler"].data_max_[0])
         _write_seen(g, config["scaler"])
+    elif kind == "log":
+        g.attrs["scale"] = float(config["scale"])  # x is divided by it inside log1p
     elif kind != "none":
         raise ValueError(f"Unknown scaling type: {kind}")
 
@@ -732,6 +734,8 @@ def build_scaling(sc):
         scaler.n_samples_seen_ = _SEEN_TYPES[sc["n_samples_seen_type"]](sc["n_samples_seen"])
         scaler.n_features_in_ = 1
         config["scaler"] = scaler
+    elif sc["type"] == "log":
+        config["scale"] = float(sc["scale"])
     return config
 
 

@@ -9,7 +9,8 @@ import numpy as np
 import time
 
 from . import prepare_data
-from .scaling import fit_scaling, scale_data, descale_data, descale_std
+from .scaling import (fit_scaling, scale_data, descale_data, descale_prediction, clip_scaled, clipped_fraction,
+                      scaled_range, LOG_CLIP_MARGIN)
 from .validation import validation_error
 from .engine_io import save_engine
 
@@ -62,6 +63,16 @@ def _build_summary_lines(method, n_tp, t_elapsed, val_metrics, output_names):
         lines.append(
             f"{out:<20} {r2:>8.4f} {rmse:>12.4e} {pearson_r:>12.4f} {nse:>8.4f} {mean_err:>12.4e} {std_err:>10.4e}"
         )
+
+    if 'clipped_below' in val_metrics:  # log scaling only
+        lines.append(f"\nValidation predictions clipped to the training range (log scaling, "
+                     f"margin {LOG_CLIP_MARGIN:g} log units above the maximum):")
+        header = f"{'Output':<20} {'Below':>8} {'Above':>8}"
+        lines += [header, "-" * len(header)]
+        for out in output_names:
+            if out in val_metrics['clipped_below']:
+                lines.append(f"{out:<20} {val_metrics['clipped_below'][out]:>8.2%} "
+                             f"{val_metrics['clipped_above'][out]:>8.2%}")
 
     return lines
 
@@ -297,15 +308,21 @@ def train_surrogate(
     if X_val is not None:
         y_pred, y_std = engine.eval_metamodel(X_val)
         # Back to physical units
+        clipped = {}
         if scaling_config is not None:
-            y_pred_phys = descale_data(y_pred, scaling_config)
-            y_std_phys = descale_std(y_std, scaling_config)
+            train_range = scaled_range(train_output_at_x)
+            clipped = clipped_fraction(y_pred, scaling_config, train_range)  # log only, else empty
+            y_pred = clip_scaled(y_pred, scaling_config, train_range)  # log: no overshoot
+            y_pred_phys, y_std_phys = descale_prediction(y_pred, y_std, scaling_config)  # median, exact std
             valid_y_phys = descale_data(valid_y, scaling_config)
         else:
             y_pred_phys = y_pred
             y_std_phys = y_std
             valid_y_phys = valid_y
         val_metrics = validation_error(true_y=valid_y_phys, sim_y=y_pred_phys, sim_std=y_std_phys, std_metrics=True)
+        if clipped:  # fraction of the [run, time] predictions per output
+            val_metrics['clipped_below'] = {k: below for k, (below, _) in clipped.items()}
+            val_metrics['clipped_above'] = {k: above for k, (_, above) in clipped.items()}
         with open(output_path / "validation_metrics.json", "w", encoding="utf-8") as f:
             json.dump(val_metrics, f, indent=2, default=lambda o: np.asarray(o).tolist())
 
